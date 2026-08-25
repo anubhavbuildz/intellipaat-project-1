@@ -1,5 +1,9 @@
 terraform {
   required_providers {
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.4"
+    }
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
@@ -7,327 +11,172 @@ terraform {
   }
 }
 
-# Default provider for general use (if needed)
 provider "aws" {
-  region = var.aws_region_virginia
+  region = var.bootstrap_region
 }
 
-# Explicit aliased provider for Virginia
-provider "aws" {
-  alias  = "virginia"
-  region = var.aws_region_virginia
-}
-
-# Explicit aliased provider for Ohio
-provider "aws" {
-  alias  = "ohio"
-  region = var.aws_region_ohio
-}
-
-# ==========================================
-# VPC & SUB-NETWORKING (Virginia Region)
-# ==========================================
-
-# Expanded CIDR block from /24 to /16 to avoid subnet sizing conflicts
-resource "aws_vpc" "virginia_cloud" {
-  provider   = aws.virginia
-  cidr_block = "10.0.0.0/16"
+resource "aws_vpc" "bootstrap" {
+  cidr_block = "10.254.0.0/16"
 
   tags = {
-    Name = "Virginia-Cloud"
+    Name = "Terraform-Bootstrap-VPC"
   }
 }
 
-resource "aws_internet_gateway" "igw" {
-  provider = aws.virginia
-  vpc_id   = aws_vpc.virginia_cloud.id
-
-  tags = {
-    Name = "Virginia-IGW"
-  }
+resource "aws_internet_gateway" "bootstrap" {
+  vpc_id = aws_vpc.bootstrap.id
 }
 
-resource "aws_subnet" "public_subnet" {
-  provider                = aws.virginia
-  vpc_id                  = aws_vpc.virginia_cloud.id
-  cidr_block              = "10.0.1.0/24"
-  availability_zone       = "us-east-1a"
+resource "aws_subnet" "bootstrap" {
+  vpc_id                  = aws_vpc.bootstrap.id
+  cidr_block              = "10.254.1.0/24"
+  availability_zone       = "${var.bootstrap_region}a"
   map_public_ip_on_launch = true
-
-  tags = {
-    Name = "Public-Subnet"
-  }
 }
 
-resource "aws_subnet" "private_subnet" {
-  provider                = aws.virginia
-  vpc_id                  = aws_vpc.virginia_cloud.id
-  cidr_block              = "10.0.2.0/24"
-  availability_zone       = "us-east-1a"
-  map_public_ip_on_launch = false
-
-  tags = {
-    Name = "Private-Subnet"
-  }
+resource "aws_route_table" "bootstrap" {
+  vpc_id = aws_vpc.bootstrap.id
 }
 
-# ==========================================
-# NAT GATEWAY COMPONENTS (For Private Subnet)
-# ==========================================
-
-resource "aws_eip" "nat_eip" {
-  provider   = aws.virginia
-  domain     = "vpc"
-  depends_on = [aws_internet_gateway.igw]
-}
-
-resource "aws_nat_gateway" "private_to_nat" {
-  provider      = aws.virginia
-  allocation_id = aws_eip.nat_eip.id
-  subnet_id     = aws_subnet.public_subnet.id # Must be placed in a public subnet
-
-  tags = {
-    Name = "Virginia-NAT-Gateway"
-  }
-}
-
-# ==========================================
-# ROUTING INFRASTRUCTURE
-# ==========================================
-
-# Public Routing Layout
-resource "aws_route_table" "public_rtw" {
-  provider = aws.virginia
-  vpc_id   = aws_vpc.virginia_cloud.id
-
-  tags = {
-    Name = "Public-Route-Table"
-  }
-}
-
-resource "aws_route" "public_route" {
-  provider               = aws.virginia
-  route_table_id         = aws_route_table.public_rtw.id
+resource "aws_route" "bootstrap_internet" {
+  route_table_id         = aws_route_table.bootstrap.id
   destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.igw.id
+  gateway_id             = aws_internet_gateway.bootstrap.id
 }
 
-resource "aws_route_table_association" "public_assoc" {
-  provider       = aws.virginia
-  subnet_id      = aws_subnet.public_subnet.id
-  route_table_id = aws_route_table.public_rtw.id
+resource "aws_route_table_association" "bootstrap" {
+  subnet_id      = aws_subnet.bootstrap.id
+  route_table_id = aws_route_table.bootstrap.id
 }
 
-# Private Routing Layout
-resource "aws_route_table" "private_rtw" {
-  provider = aws.virginia
-  vpc_id   = aws_vpc.virginia_cloud.id
+resource "aws_security_group" "bootstrap" {
+  name        = "terraform-bootstrap"
+  description = "Allow the Terraform runner outbound access"
+  vpc_id      = aws_vpc.bootstrap.id
 
-  tags = {
-    Name = "Private-Route-Table"
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 }
 
-resource "aws_route" "private_route" {
-  provider               = aws.virginia
-  route_table_id         = aws_route_table.private_rtw.id
-  destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.private_to_nat.id
+data "archive_file" "infrastructure" {
+  type        = "zip"
+  source_dir  = "${path.module}/infrastructure"
+  output_path = "${path.module}/infrastructure.zip"
+  excludes    = [".terraform", "*.tfstate", "*.tfstate.*"]
 }
 
-resource "aws_route_table_association" "private_assoc" {
-  provider       = aws.virginia
-  subnet_id      = aws_subnet.private_subnet.id
-  route_table_id = aws_route_table.private_rtw.id
+resource "aws_s3_bucket" "infrastructure" {
+  bucket_prefix = "terraform-infrastructure-"
+  force_destroy = true
 }
 
-
-
-
-
-
-# ==========================================
-# VPC & SUB-NETWORKING (Ohio Region)
-# ==========================================
-
-# Expanded CIDR block from /24 to /16 to avoid subnet sizing conflicts
-resource "aws_vpc" "ohio_cloud" {
-  provider   = aws.ohio
-  cidr_block = "10.0.0.0/16"
-
-  tags = {
-    Name = "Ohio-Cloud"
-  }
+resource "aws_s3_bucket_public_access_block" "infrastructure" {
+  bucket                  = aws_s3_bucket.infrastructure.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
 }
 
-resource "aws_internet_gateway" "igw_ohio" {
-  provider = aws.ohio
-  vpc_id   = aws_vpc.ohio_cloud.id
+resource "aws_s3_bucket_policy" "infrastructure" {
+  bucket = aws_s3_bucket.infrastructure.id
 
-  tags = {
-    Name = "Ohio -IGW"
-  }
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyInsecureTransport"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource = [
+        aws_s3_bucket.infrastructure.arn,
+        "${aws_s3_bucket.infrastructure.arn}/*"
+      ]
+      Condition = {
+        Bool = {
+          "aws:SecureTransport" = "false"
+        }
+      }
+    }]
+  })
 }
 
-resource "aws_subnet" "public_subnet_ohio" {
-  provider                = aws.ohio
-  vpc_id                  = aws_vpc.ohio_cloud.id
-  cidr_block              = "10.0.1.0/24"
-  availability_zone       = "us-east-2a"
-  map_public_ip_on_launch = true
-
-  tags = {
-    Name = "Public-Subnet"
-  }
+resource "aws_s3_object" "infrastructure" {
+  bucket = aws_s3_bucket.infrastructure.id
+  key    = "infrastructure.zip"
+  source = data.archive_file.infrastructure.output_path
+  etag   = data.archive_file.infrastructure.output_md5
 }
 
-resource "aws_subnet" "private_subnet_ohio" {
-  provider                = aws.ohio
-  vpc_id                  = aws_vpc.ohio_cloud.id
-  cidr_block              = "10.0.2.0/24"
-  availability_zone       = "us-east-2a"
-  map_public_ip_on_launch = false
+resource "aws_iam_role" "terraform_runner" {
+  name = "terraform-runner-role"
 
-  tags = {
-    Name = "Private-Subnet"
-  }
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
 }
 
-# ==========================================
-# NAT GATEWAY COMPONENTS (For Private Subnet)
-# ==========================================
+resource "aws_iam_role_policy" "terraform_runner" {
+  name = "terraform-runner-infrastructure-access"
+  role = aws_iam_role.terraform_runner.id
 
-resource "aws_eip" "nat_eip_ohio" {
-  provider   = aws.ohio
-  domain     = "vpc"
-  depends_on = [aws_internet_gateway.igw_ohio]
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:GetObject"]
+      Resource = "${aws_s3_bucket.infrastructure.arn}/*"
+    }]
+  })
 }
 
-resource "aws_nat_gateway" "private_to_nat_ohio" {
-  provider      = aws.ohio
-  allocation_id = aws_eip.nat_eip_ohio.id
-  subnet_id     = aws_subnet.public_subnet_ohio.id
-
-  tags = {
-    Name = "Ohio-NAT-Gateway"
-  }
+resource "aws_iam_role_policy_attachment" "terraform_admin" {
+  role       = aws_iam_role.terraform_runner.name
+  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
 }
 
-
-
-# ==========================================
-# ROUTING INFRASTRUCTURE
-# ==========================================
-
-# Public Routing Layout
-resource "aws_route_table" "public_rtw_ohio" {
-  provider = aws.ohio
-  vpc_id   = aws_vpc.ohio_cloud.id
-
-  tags = {
-    Name = "Public-Route-Table-Ohio"
-  }
+resource "aws_iam_instance_profile" "terraform_runner" {
+  name = "terraform-runner-profile"
+  role = aws_iam_role.terraform_runner.name
 }
 
-resource "aws_route" "public_route_ohio" {
-  provider               = aws.ohio
-  route_table_id         = aws_route_table.public_rtw_ohio.id
-  destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.igw_ohio.id
-}
-
-resource "aws_route_table_association" "public_assoc_ohio" {
-  provider       = aws.ohio
-  subnet_id      = aws_subnet.public_subnet_ohio.id
-  route_table_id = aws_route_table.public_rtw_ohio.id
-}
-
-# Private Routing Layout
-resource "aws_route_table" "private_rtw_ohio" {
-  provider = aws.ohio
-  vpc_id   = aws_vpc.ohio_cloud.id
-
-  tags = {
-    Name = "Private-Route-Table-Ohio"
-  }
-}
-
-resource "aws_route" "private_route_ohio" {
-  provider               = aws.ohio
-  route_table_id         = aws_route_table.private_rtw_ohio.id
-  destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.private_to_nat_ohio.id
-}
-
-resource "aws_route_table_association" "private_assoc_ohio" {
-  provider       = aws.ohio
-  subnet_id      = aws_subnet.private_subnet_ohio.id
-  route_table_id = aws_route_table.private_rtw_ohio.id
-}
-
-
-
-# ==========================================
-# COMPUTE INSTANCES (EC2)
-# ==========================================
-
-# Default instance configuration
 resource "aws_instance" "terraform_server" {
-  ami           = var.ami_id
-  instance_type = var.instance_type
-  user_data     = file("${path.module}/scripts/terraform_runner.sh")
+  ami                         = var.ami_id
+  instance_type               = var.instance_type
+  subnet_id                   = aws_subnet.bootstrap.id
+  associate_public_ip_address = true
+  vpc_security_group_ids      = [aws_security_group.bootstrap.id]
+  iam_instance_profile        = aws_iam_instance_profile.terraform_runner.name
+  user_data = templatefile("${path.module}/scripts/terraform_runner.sh", {
+    bucket = aws_s3_bucket.infrastructure.id
+    key    = aws_s3_object.infrastructure.key
+    region = var.bootstrap_region
+  })
+
+  depends_on = [aws_iam_role_policy_attachment.terraform_admin]
 
   tags = {
     Name = "Terraform-Server"
   }
 }
 
-# Explicitly assigned to the Virginia Provider
-resource "aws_instance" "north_virginia_public" {
-  provider      = aws.virginia
-  ami           = var.ami_id
-  instance_type = var.instance_type
-  subnet_id     = aws_subnet.public_subnet.id
-  user_data     = file("${path.module}/scripts/web.sh")
-
-
-  tags = {
-    Name = "Virginia-Server-pub"
-  }
+output "terraform_server_public_ip" {
+  description = "Public IP address of the Terraform runner"
+  value       = aws_instance.terraform_server.public_ip
 }
 
-resource "aws_instance" "north_virginia_private" {
-  provider      = aws.virginia
-  ami           = var.ami_id
-  instance_type = var.instance_type
-  subnet_id     = aws_subnet.private_subnet.id
-  user_data     = file("${path.module}/scripts/database.sh")
-
-  tags = {
-    Name = "Virginia-Server-pvt"
-  }
-}
-
-# Explicitly assigned to the Ohio Provider
-resource "aws_instance" "ohio_public" {
-  provider      = aws.ohio
-  ami           = var.ami_id_ohio
-  instance_type = var.instance_type
-  subnet_id     = aws_subnet.public_subnet_ohio.id
-  user_data     = file("${path.module}/scripts/web.sh")
-  tags = {
-    Name = "Ohio-Server-pub"
-  }
-}
-
-resource "aws_instance" "ohio_private" {
-  provider      = aws.ohio
-  ami           = var.ami_id_ohio
-  instance_type = var.instance_type
-  subnet_id     = aws_subnet.private_subnet_ohio.id
-  user_data     = file("${path.module}/scripts/database.sh")
-
-  tags = {
-    Name = "Ohio-Server-pvt"
-  }
+output "infrastructure_bucket" {
+  description = "S3 bucket containing the child Terraform configuration"
+  value       = aws_s3_bucket.infrastructure.id
 }

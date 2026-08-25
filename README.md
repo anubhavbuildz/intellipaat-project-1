@@ -4,25 +4,26 @@
 
 ![AWS multi-region architecture](assets/Architecture.png)
 
-This project provisions a small multi-region AWS environment with Terraform:
+This project provisions a small multi-region AWS environment through a two-stage Terraform deployment:
 
-- **North Virginia (`us-east-1`)** and **Ohio (`us-east-2`)** are managed through separate AWS provider aliases.
-- Each region contains a VPC with public and private subnets.
-- Internet gateways provide public subnet connectivity, while NAT gateways allow private subnet instances to reach the internet for package installation without exposing them directly.
-- Public EC2 instances run the web server setup, and private EC2 instances run the database setup.
-- AMI IDs are configurable independently for Virginia and Ohio through `terraform.tfvars`, which allows region-specific AMIs.
+- The bootstrap stage creates a dedicated public VPC for the Terraform runner, an S3 handoff bucket, and an EC2 IAM instance profile.
+- The runner installs Terraform and AWS CLI, downloads the child configuration from S3, and applies it automatically.
+- The child configuration creates the North Virginia (`us-east-1`) and Ohio (`us-east-2`) VPCs, subnets, NAT gateways, security groups, and application servers.
+- Public instances install and start Apache, with HTTP traffic allowed on port 80. Private instances install and start MySQL.
 
 ## Architectural Decisions
 
-### One Terraform configuration for the whole environment
+### Two Terraform configurations
 
-Instead of creating and maintaining a separate Terraform server or separate infrastructure configuration for each region, the deployment is defined in one Terraform configuration. Provider aliases let the same configuration create resources in both regions while keeping each resource explicitly associated with the correct region.
+Terraform cannot create an instance and then use that instance to continue the same apply. The root configuration therefore creates only the bootstrap resources. It packages `infrastructure/` into S3, and the runner applies that child configuration after it starts.
 
-### One automation script for the Terraform host
+The bootstrap Terraform state and child Terraform state are separate. The child state is created on the runner in `/opt/infrastructure`.
 
-The Terraform host is created as part of the same infrastructure automation. Its bootstrap process is defined in the single `scripts/terraform_runner.sh` script, which installs the tools required to run Terraform. This avoids creating a separate server setup process and keeps the host provisioning repeatable.
+### IAM-based handoff
 
-The web and database EC2 instances still use their purpose-specific bootstrap scripts, `scripts/web.sh` and `scripts/database.sh`, so each application role receives only its required software.
+The runner receives an EC2 instance profile rather than hardcoded AWS keys. The role can read the private S3 package and manage the resources defined by the child configuration.
+
+The web and database instances use their purpose-specific bootstrap scripts, `infrastructure/scripts/web.sh` and `infrastructure/scripts/database.sh`.
 
 ### Public and private network separation
 
@@ -30,36 +31,47 @@ Web instances are placed in public subnets so they can receive internet traffic.
 
 ## Project Files
 
-- `main.tf` - AWS providers, networking, NAT gateways, routes, and EC2 instances.
-- `var.tf` - Terraform input variable definitions.
-- `terraform.tfvars` - Region-specific AMI values.
-- `scripts/terraform_runner.sh` - Terraform host bootstrap script.
-- `scripts/web.sh` - Nginx installation script.
-- `scripts/database.sh` - MySQL installation script.
+- `main.tf` - Bootstrap VPC, S3 handoff, IAM role, and Terraform runner.
+- `var.tf` - Bootstrap input variable definitions.
+- `terraform.tfvars` - Bootstrap runner AMI and instance type.
+- `scripts/terraform_runner.sh` - Runner bootstrap, S3 download, and child apply script.
+- `infrastructure/main.tf` - Virginia and Ohio VPCs, routing, NAT gateways, security groups, and EC2 instances.
+- `infrastructure/var.tf` and `infrastructure/terraform.tfvars` - Child configuration inputs and regional AMI IDs.
+- `infrastructure/scripts/web.sh` - Apache installation and startup script.
+- `infrastructure/scripts/database.sh` - MySQL installation and startup script.
 
 ## Usage
 
-1. Set valid region-specific AMI IDs in `terraform.tfvars`.
-2. Initialize Terraform:
+1. Configure AWS credentials locally with permission to create the bootstrap and child resources.
+2. Set a valid Ubuntu/Debian AMI ID for the bootstrap runner in `terraform.tfvars`.
+3. Set valid region-specific Ubuntu/Debian AMI IDs in `infrastructure/terraform.tfvars`.
+4. Deploy the bootstrap stage from the repository root:
 
 	```bash
 	terraform init
+	terraform apply -auto-approve
 	```
 
-3. Review the deployment plan:
+5. Wait for the runner to finish. Its cloud-init output is in `/var/log/terraform-runner.log` on the runner. The child configuration is stored on that server in `/opt/infrastructure`.
+
+6. Check the bootstrap output for the runner's public IP:
 
 	```bash
-	terraform plan
+	terraform output terraform_server_public_ip
 	```
 
-4. Apply the infrastructure:
+7. To remove everything, connect to the runner and destroy the child stack first:
 
 	```bash
-	terraform apply
+	ssh <user>@<terraform-server-public-ip>
+	cd /opt/infrastructure
+	terraform destroy -auto-approve
 	```
 
-5. Remove the resources when finished:
+8. From the repository root, destroy the bootstrap stage:
 
 	```bash
-	terraform destroy
+	terraform destroy -auto-approve
 	```
+
+Destroying the bootstrap stage before the child stack can leave the regional resources running because the child configuration has its own Terraform state.

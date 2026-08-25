@@ -1,5 +1,6 @@
 # Terraform working directory
 .terraform/
+*.zip
 
 # Local Terraform state
 *.tfstate
